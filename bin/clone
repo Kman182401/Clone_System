@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""
+clone - Intelligent file synchronization for the SPY Vertical Spread Trading System.
+
+Features:
+- Smart file relevance detection using AST dependency analysis
+- Comprehensive PII/secret detection and redaction (50+ pattern categories)
+- Context-aware confidence scoring for accurate detection
+- Automatic sync to GitHub with conflict resolution
+
+Version: 2.2.0 (Integrated smart analysis and enhanced PII detection)
+"""
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path, PurePosixPath
+import re
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print("Python 3.11+ required (tomllib stdlib).", file=sys.stderr)
+    sys.exit(2)
+
+REPO = Path(__file__).resolve().parents[1]
+MANIFEST = REPO / "MANIFEST_CLONE.json"
+LIB_PATH = REPO / "lib"
+
+# Add lib to path for imports
+if str(LIB_PATH) not in sys.path:
+    sys.path.insert(0, str(LIB_PATH))
+
+# Import enhanced detection modules
+try:
+    from pii_detector import PIIDetector, Sensitivity, PIICategory
+    HAS_PII_DETECTOR = True
+except ImportError:
+    HAS_PII_DETECTOR = False
+    PIIDetector = None
+
+try:
+    from smart_file_analyzer import SmartFileAnalyzer, FileCategory
+    HAS_SMART_ANALYZER = True
+except ImportError:
+    HAS_SMART_ANALYZER = False
+    SmartFileAnalyzer = None
+
+global_cfg: dict[str, object] = {}
+
+# Smart analyzer singleton
+_smart_analyzer: "SmartFileAnalyzer | None" = None
+
+
+def _get_smart_analyzer(source_path: Path) -> "SmartFileAnalyzer | None":
+    """Lazy-initialize the smart file analyzer for a given source."""
+    global _smart_analyzer
+    if _smart_analyzer is None and HAS_SMART_ANALYZER:
+        additional_keywords = global_cfg.get("trading_keywords", None)
+        min_relevance = global_cfg.get("min_relevance", 0.3)
+        _smart_analyzer = SmartFileAnalyzer(
+            root_path=source_path,
+            additional_keywords=additional_keywords,
+            min_relevance=min_relevance
+        )
+    return _smart_analyzer
+
+
+def analyze_source_relevance(source_path: Path, verbose: bool = False) -> dict:
+    """
+    Analyze files in source directory for relevance to trading system.
+
+    Returns dict with:
+        - relevant_files: list of paths that should be included
+        - excluded_files: list of paths that are not relevant
+        - analysis_summary: statistics about the analysis
+    """
+    analyzer = _get_smart_analyzer(source_path)
+    if analyzer is None:
+        # No smart analysis available - include all files
+        return {
+            "relevant_files": None,  # None means include all
+            "excluded_files": [],
+            "analysis_summary": {"mode": "fallback", "reason": "SmartFileAnalyzer not available"}
+        }
+
+    result = analyzer.analyze()
+
+    # Use the recommended includes/excludes from the analyzer
+    relevant_paths = list(result.recommended_includes)
+    excluded_paths = list(result.recommended_excludes)
+
+    if verbose:
+        print(f"\n[clone] Smart File Analysis Results:")
+        print(f"  Total files analyzed: {len(result.files)}")
+        print(f"  Core modules: {len(result.core_modules)}")
+        print(f"  Recommended includes: {len(relevant_paths)}")
+        print(f"  Recommended excludes: {len(excluded_paths)}")
+        print(f"\n  Category breakdown:")
+        category_counts: dict[str, int] = {}
+        for filepath, file_info in result.files.items():
+            cat = file_info.category.name
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+        for cat, count in sorted(category_counts.items()):
+            print(f"    {cat}: {count}")
+
+        if excluded_paths and verbose:
+            print(f"\n  Sample excluded files (low relevance):")
+            excluded_with_scores = [
+                (fp, result.files[fp].relevance_score)
+                for fp in excluded_paths if fp in result.files
+            ]
+            for fp, score in sorted(excluded_with_scores, key=lambda x: x[1])[:10]:
+                print(f"    - {fp} (score: {score:.2f})")
+
+    return {
+        "relevant_files": relevant_paths,
+        "excluded_files": excluded_paths,
+        "analysis_summary": {
+            "mode": "smart",
+            "total": len(result.files),
+            "relevant": len(relevant_paths),
+            "excluded": len(excluded_paths),
+            "threshold": analyzer.min_relevance,
+        }
+    }
+
+
+# ---------------------- helpers ----------------------
+
+def run(cmd, *, check=True, capture=False):
+    kwargs = {"check": check}
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    return subprocess.run(cmd, **kwargs)
+
+
+def git(*args, capture=False, check=True):
+    return run(["git", "-C", str(REPO), *args], check=check, capture=capture)
+
+
+def working_tree_state() -> str:
+    return git("status", "--porcelain", capture=True).stdout.decode()
+
+
+def current_branch() -> str:
+    return git("rev-parse", "--abbrev-ref", "HEAD", capture=True).stdout.decode().strip()
+
+
+def push_to_origin(branch: str) -> None:
+    cur = current_branch()
+    refspec = branch
+    if cur and cur != branch:
+        refspec = f"HEAD:{branch}"
+        print(f"[clone] Note: current branch is {cur}; pushing HEAD to origin/{branch}.")
+    git("push", "-u", "origin", refspec)
+
+def _autopush_cfg() -> dict[str, object]:
+    cfg = global_cfg.get("autopush", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _autopush_enabled() -> bool:
+    return bool(_autopush_cfg().get("enabled", False))
+
+
+def _changed_paths() -> list[str]:
+    """
+    Return unique repo-relative paths currently changed (tracked or untracked).
+    Rename/copy entries use the destination path.
+    """
+    state = working_tree_state()
+    paths: list[str] = []
+    for line in state.splitlines():
+        if not line:
+            continue
+        # Porcelain v1 lines: XY<space>path (or XY<space>old -> new)
+        path = line[3:].strip() if len(line) >= 4 else ""
+        if not path:
+            continue
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path:
+            paths.append(path)
+    return sorted(set(paths))
+
+
+def _match_any_glob(path: str, patterns: list[str]) -> bool:
+    """
+    Match repo-relative paths against allow/deny globs.
+
+    Note: pathlib's PurePath.match treats patterns like `dir/**` as only
+    one-level deep (it won't match `dir/a/b.txt`). For clone-watch allowlists,
+    we want gitignore-style semantics where `dir/**` matches anything under
+    `dir/` at any depth.
+    """
+    # `git status --porcelain` returns repo-relative paths without a leading `./`.
+    # If a caller passes `./foo`, strip that exact prefix only (do not strip
+    # leading dots from dotfiles like `.clone.toml`).
+    path_norm = path
+    if path_norm.startswith("./"):
+        path_norm = path_norm[2:]
+    path_norm = path_norm.lstrip("/")
+    pp = PurePosixPath(path_norm)
+    for pat in patterns:
+        pat = str(pat).strip()
+        if not pat:
+            continue
+        if pat.endswith("/**"):
+            prefix = pat[:-3]
+            if path_norm == prefix or path_norm.startswith(prefix + "/"):
+                return True
+            continue
+        if pp.match(pat):
+            return True
+    return False
+
+
+def _autopush_partition_paths(paths: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Split paths into (allowed, disallowed) according to [global.autopush] allow/deny globs.
+    """
+    if not _autopush_enabled():
+        return paths, []
+
+    cfg = _autopush_cfg()
+    allow = [str(p) for p in (cfg.get("allow_globs", []) or []) if str(p).strip()]
+    deny = [str(p) for p in (cfg.get("deny_globs", []) or []) if str(p).strip()]
+
+    allowed: list[str] = []
+    disallowed: list[str] = []
+    for p in paths:
+        if deny and _match_any_glob(p, deny):
+            disallowed.append(p)
+            continue
+        if not allow or _match_any_glob(p, allow):
+            allowed.append(p)
+        else:
+            disallowed.append(p)
+    return allowed, disallowed
+
+
+def stage_changes_for_commit() -> tuple[list[str], list[str]]:
+    """
+    Stage changes for the next commit.
+
+    If autopush is enabled, stage only allowlisted paths and leave the rest unstaged.
+    Returns (staged_paths, unstaged_paths).
+    """
+    paths = _changed_paths()
+    if not paths:
+        return [], []
+
+    allowed, disallowed = _autopush_partition_paths(paths)
+    if _autopush_enabled():
+        # Ensure the index contains only the allowlisted subset.
+        git("reset")
+        if allowed:
+            git("add", "-A", "--", *allowed)
+    else:
+        git("add", "-A")
+
+    return allowed, disallowed
+
+
+def auto_commit_dirty_tree() -> bool:
+    state = working_tree_state()
+    if not state.strip():
+        return False
+    print("[clone] Auto-committing dirty working tree before sync.")
+    staged, unstaged = stage_changes_for_commit()
+    if _autopush_enabled() and unstaged:
+        print(f"[clone] Autopush filter: leaving {len(unstaged)} change(s) unstaged (outside allowlist).")
+    if not staged:
+        print("[clone] Nothing allowlisted to stage for auto-commit; continuing.")
+        return False
+    # Sanitize staged files by default unless disabled in config
+    sanitize_enabled = bool(global_cfg.get("sanitize_secrets", True))
+    if sanitize_enabled:
+        modified = sanitize_staged_files()
+        if modified:
+            print(f"[clone] Sanitized {len(modified)} file(s) to redact secrets.")
+    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+        print("[clone] Nothing staged after auto-commit attempt; continuing.")
+        return False
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    git("commit", "-m", f"clone(pre-sync): auto-commit dirty tree {timestamp}")
+    return True
+
+
+def ensure_repo_clean(force: bool, auto_commit_enabled: bool) -> bool:
+    auto_committed = False
+    state = working_tree_state()
+    if not state.strip():
+        return auto_committed
+    if auto_commit_enabled:
+        auto_committed = auto_commit_dirty_tree()
+        state = working_tree_state()
+        if not state.strip():
+            return auto_committed
+        if _autopush_enabled():
+            remaining = _changed_paths()
+            allowed, _disallowed = _autopush_partition_paths(remaining)
+            if not allowed:
+                print(
+                    "[clone] Note: working tree has changes outside autopush allowlist; leaving them uncommitted.",
+                )
+                return auto_committed
+        if force:
+            print("[clone] Warning: tree still dirty after auto-commit; proceeding because --force was supplied.", file=sys.stderr)
+            return auto_committed
+        print("Working tree remains dirty after auto-commit. Resolve manually or rerun with --force.", file=sys.stderr)
+        sys.exit(2)
+    else:
+        if force:
+            print("[clone] Proceeding with dirty tree (auto-commit disabled).", file=sys.stderr)
+            return auto_committed
+        print("Working tree is dirty. Commit or stash unrelated edits first, or use --force.", file=sys.stderr)
+        sys.exit(2)
+    return auto_committed
+
+
+# ---------------------- secret scanning ----------------------
+
+_SECRET_RES = [
+    # Quoted literals only; avoids flagging env references
+    re.compile(r"(?i)api[_-]?key\s*[:=]\s*['\"][A-Za-z0-9_\-]{12,}['\"]"),
+    re.compile(r"(?i)secret\s*[:=]\s*['\"][A-Za-z0-9/+=]{8,}['\"]"),
+    re.compile(r"(?i)password\s*[:=]\s*['\"][^'\"]{6,}['\"]"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_.]+\.[A-Za-z0-9\-_.]+\.[A-Za-z0-9\-_.]+"),
+    re.compile(r"(?i)client[_-]?secret\s*[:=]"),
+    re.compile(r"(?i)refresh[_-]?token\s*[:=]"),
+]
+
+SAFE_SECRET_PATHS = {
+    "config/iceberg_catalog.example.yaml",
+    "scripts/publish_iceberg_tables.py",
+    # Exclude lib directory - contains detection patterns that look like secrets
+    "lib/pii_detector.py",
+    "lib/smart_file_analyzer.py",
+}
+
+# ---------------------- sanitization ----------------------
+
+# Initialize enhanced PII detector if available
+_pii_detector: "PIIDetector | None" = None
+
+def _get_pii_detector() -> "PIIDetector | None":
+    """Lazy-initialize the PII detector singleton."""
+    global _pii_detector
+    if _pii_detector is None and HAS_PII_DETECTOR:
+        _pii_detector = PIIDetector(
+            sensitivity=Sensitivity.MEDIUM,
+            context_window=50
+        )
+    return _pii_detector
+
+# Fallback patterns for when PIIDetector is not available
+_SANITIZE_RULES_FALLBACK = [
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "<AWS_ACCESS_KEY_ID>"),
+    (re.compile(r"ASIA[0-9A-Z]{16}"), "<AWS_TEMP_ACCESS_KEY_ID>"),
+    (re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+]{35,}['\"]?"), "AWS_SECRET_ACCESS_KEY=<REDACTED>"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "<GITHUB_TOKEN>"),
+    (re.compile(r"ghp_[A-Za-z0-9]{36,}"), "<GITHUB_TOKEN>"),
+    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "<OPENAI_API_KEY>"),
+    (re.compile(r"(?i)OPENAI_API_KEY\s*[:=]\s*['\"]?[A-Za-z0-9\-_]{8,}['\"]?"), "OPENAI_API_KEY=<REDACTED>"),
+    (re.compile(r"hf_[A-Za-z0-9]{20,}"), "<HF_TOKEN>"),
+    (re.compile(r"AIza[0-9A-Za-z\-_]{35}"), "<GOOGLE_API_KEY>"),
+    (re.compile(r"xox[aboprs]-[A-Za-z0-9\-]{10,}"), "<SLACK_TOKEN>"),
+    (re.compile(r"stripe_(?:live|test)_[A-Za-z0-9]{10,}"), "<STRIPE_KEY>"),
+    (re.compile(r"\bAC[0-9]{32}\b"), "<TWILIO_ACCOUNT_SID>"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_.]+\.[A-Za-z0-9\-_.]+\.[A-Za-z0-9\-_.]+"), "Bearer <JWT_TOKEN>"),
+    (re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)['\"][^'\"]{8,}['\"]"), r"\1<API_KEY>"),
+    (re.compile(r"(?i)(client[_-]?secret\s*[:=]\s*)['\"][^'\"]{8,}['\"]"), r"\1<CLIENT_SECRET>"),
+    (re.compile(r"-----BEGIN (?:RSA |EC |)PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |)PRIVATE KEY-----"), "<PRIVATE_KEY_BLOCK>"),
+]
+
+_SANITIZE_RULES_ALWAYS = [
+    # Scrub machine-specific home directories from logs/docs.
+    (re.compile(r"$HOME/\s]+"), "$HOME"),
+    (re.compile(r"$HOME/\s]+"), "$HOME"),
+    (re.compile(r"(?i)C:\\\\Users\\\\[^\\\\\s]+"), r"%USERPROFILE%"),
+    # Conservative email redaction (keeps GitHub mirror PII-free).
+    (re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b"), "<REDACTED_EMAIL>"),
+]
+
+def _sanitize_text(text: str, file_path: str = "") -> tuple[str, list[dict]]:
+    """
+    Sanitize text by detecting and redacting PII/secrets.
+
+    Returns:
+        Tuple of (sanitized_text, list_of_findings)
+    """
+    detector = _get_pii_detector()
+
+    if detector is not None:
+        # Use comprehensive PII detector
+        matches = detector.scan(text)
+        redacted = detector.redact(text, matches)
+        findings = [
+            {
+                "category": m.category.value,
+                "original": m.value[:20] + "..." if len(m.value) > 20 else m.value,
+                "confidence": m.confidence,
+                "start": m.start,
+            }
+            for m in matches
+        ]
+        out = redacted
+        for rx, repl in _SANITIZE_RULES_ALWAYS:
+            try:
+                out = rx.sub(repl, out)
+            except re.error:
+                continue
+        return out, findings
+    else:
+        # Fallback to basic regex patterns
+        out = text
+        findings = []
+        for rx, repl in _SANITIZE_RULES_FALLBACK:
+            try:
+                matches = rx.findall(out)
+                if matches:
+                    findings.append({"pattern": rx.pattern[:30], "count": len(matches)})
+                out = rx.sub(repl, out)
+            except re.error:
+                continue
+        for rx, repl in _SANITIZE_RULES_ALWAYS:
+            try:
+                out = rx.sub(repl, out)
+            except re.error:
+                continue
+        return out, findings
+
+def sanitize_staged_files(verbose: bool = False) -> list[str]:
+    """
+    Sanitize all staged files by detecting and redacting PII/secrets.
+
+    Args:
+        verbose: If True, print detailed findings for each file
+
+    Returns:
+        List of file paths that were modified
+    """
+    names = git("diff", "--cached", "--name-only", capture=True).stdout.decode().splitlines()
+    changed: list[str] = []
+    all_findings: dict[str, list[dict]] = {}
+
+    # Directories to exclude from sanitization (contain detection patterns)
+    excluded_dirs = {"lib/", "tests/", ".git/"}
+
+    for n in names:
+        # Skip files in excluded directories
+        if any(n.startswith(d) or f"/{d}" in n for d in excluded_dirs):
+            continue
+        # Skip safe paths
+        if n in SAFE_SECRET_PATHS:
+            continue
+        p = REPO / n
+        if not p.is_file():
+            continue
+        try:
+            if p.stat().st_size > 1024 * 1024:
+                continue
+        except Exception:
+            continue
+        if not _is_text_file(p):
+            continue
+        try:
+            orig = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        redacted, findings = _sanitize_text(orig, file_path=str(p))
+
+        if redacted != orig:
+            p.write_text(redacted, encoding="utf-8")
+            changed.append(n)
+            if findings:
+                all_findings[n] = findings
+
+    if changed:
+        git("add", *changed)
+
+    # Report findings if verbose or if using enhanced detector
+    if all_findings and (verbose or HAS_PII_DETECTOR):
+        print(f"[clone] PII/Secret Detection Summary:")
+        for filepath, findings in all_findings.items():
+            print(f"  {filepath}:")
+            for f in findings[:5]:  # Limit output
+                if "category" in f:
+                    print(f"    - {f['category']}: confidence={f['confidence']:.2f}, pos={f.get('start', '?')}")
+                else:
+                    print(f"    - Pattern match: {f.get('pattern', 'unknown')}")
+            if len(findings) > 5:
+                print(f"    ... and {len(findings) - 5} more")
+
+    return changed
+
+
+def _is_text_file(path: Path) -> bool:
+    try:
+        data = path.read_bytes()[:2048]
+    except Exception:
+        return False
+    # Heuristic: reject if it contains many NUL bytes
+    return data.count(b"\x00") < 2
+
+
+def _is_example_or_placeholder(text: str, path: Path) -> bool:
+    if any(s in text for s in ("REPLACE_ME", "YOUR_", "<YOUR_", "PLACEHOLDER", "REDACTED")):
+        return True
+    name = path.name
+    suffixes = ('.example', '.template', '.sample')
+    if name.endswith(suffixes):
+        return True
+    lowered = name.lower()
+    for suffix in suffixes:
+        marker = f"{suffix}."
+        if marker in lowered:
+            return True
+    return False
+
+
+def scan_paths_for_secrets(paths) -> list[tuple[str, str]]:
+    """Return list of (path, pattern) for any suspicious matches."""
+    findings: list[tuple[str, str]] = []
+    for p in paths:
+        pp = Path(p)
+        if not pp.is_file():
+            continue
+        # Skip known noise locations and non-target types
+        skip_subpaths = ["/site-packages/", "/.venv/", "/node_modules/"]
+        sp = str(pp)
+        if any(s in sp for s in skip_subpaths):
+            continue
+        allowed_exts = {".py", ".pyi", ".env", ".yml", ".yaml", ".ini", ".toml", ".json", ".md", ".conf", ".cfg", ".sh", ".ps1"}
+        if pp.suffix and pp.suffix.lower() not in allowed_exts:
+            continue
+        # Skip very large files
+        try:
+            if pp.stat().st_size > 5 * 1024 * 1024:
+                continue
+        except Exception:
+            continue
+        if not _is_text_file(pp):
+            continue
+        try:
+            text = pp.read_text(errors="ignore")
+        except Exception:
+            continue
+        try:
+            rel = str(pp.relative_to(REPO))
+        except ValueError:
+            rel = str(pp)
+        if rel in SAFE_SECRET_PATHS:
+            continue
+        # Skip benign examples/placeholders for generic key/password patterns,
+        # but still allow high-signal regexes (AWS keys, JWTs) to match below.
+        skip_generic = _is_example_or_placeholder(text, pp)
+        for rx in _SECRET_RES:
+            # For generic patterns, honor skip_generic
+            p = rx.pattern.lower()
+            if skip_generic and (p.startswith("(?i)password") or "api[_-]?key" in p or ("secret" in p and "client[_-]?secret" not in p)):
+                continue
+            if rx.search(text):
+                findings.append((str(pp), rx.pattern))
+                break
+    return findings
+
+
+def scan_tracked_repo_for_secrets() -> list[tuple[str, str]]:
+    files = git("ls-files", capture=True).stdout.decode().splitlines()
+    return scan_paths_for_secrets(files)
+
+
+def rsync_copy(src: Path, dest: Path, excludes, *, dry_run: bool, size_cap_mb, delete: bool,
+               includes: list[str] | None = None) -> subprocess.CompletedProcess:
+    args = [
+        "rsync",
+        "-a",
+        "--no-perms",
+        "--no-owner",
+        "--no-group",
+        "--prune-empty-dirs",
+    ]
+    if dry_run:
+        args.append("-n")
+    if size_cap_mb and size_cap_mb > 0:
+        args.extend(["--max-size", f"{int(size_cap_mb)}m"])
+    # Optional include list: when provided, copy only matching files and prune others.
+    # Implement as ordered rsync filters: include patterns first, then a catch-all exclude.
+    if includes:
+        for pat in includes:
+            args.extend(["--include", pat])
+        args.extend(["--exclude", "*"])
+    else:
+        for pattern in excludes:
+            args.extend(["--exclude", pattern])
+
+    if src.is_dir():
+        src_arg = str(src) + ("/" if not str(src).endswith("/") else "")
+        dest.mkdir(parents=True, exist_ok=True)
+        dest_arg = str(dest) + ("/" if not str(dest).endswith("/") else "")
+        if delete:
+            args.append("--delete")
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src_arg = str(src)
+        dest_arg = str(dest)
+        # deleting doesn't make sense for single files
+
+    args.extend([src_arg, dest_arg])
+    return run(args, capture=True)
+
+
+def enforce_repo_relative(path: Path) -> Path:
+    try:
+        rel = path.relative_to(REPO)
+    except ValueError:
+        print(f"Configured destination {path} escapes repository root {REPO}", file=sys.stderr)
+        sys.exit(2)
+    return rel
+
+
+def build_manifest(dest_paths):
+    records = []
+    seen = set()
+    for dest in dest_paths:
+        if dest.is_dir():
+            for file_path in sorted(dest.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                rel = file_path.relative_to(REPO)
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                h = hashlib.sha256()
+                with file_path.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                records.append(
+                    {
+                        "path": str(rel),
+                        "sha256": h.hexdigest(),
+                        "size": file_path.stat().st_size,
+                    }
+                )
+        elif dest.exists():
+            rel = dest.relative_to(REPO)
+            if rel not in seen and dest.is_file():
+                seen.add(rel)
+                h = hashlib.sha256(dest.read_bytes()).hexdigest()
+                records.append(
+                    {
+                        "path": str(rel),
+                        "sha256": h,
+                        "size": dest.stat().st_size,
+                    }
+                )
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "files": records,
+    }
+
+
+# ---------------------- main ----------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Reconcile local trading-system files into the repository and push.")
+    parser.add_argument("--dry-run", action="store_true", help="Analyze only; no writes or commits")
+    parser.add_argument("--push", action="store_true", help="Push after committing (default if not --no-push)")
+    parser.add_argument("--no-push", action="store_true", help="Do not push even if a commit is made")
+    parser.add_argument("--rebase", action="store_true", help="git fetch && rebase --autostash origin/<branch> before syncing")
+    parser.add_argument("--pr", action="store_true", help="Commit to sync/review-<timestamp> branch instead of main")
+    parser.add_argument("--allow-large", action="store_true", help="Disable size cap on rsync")
+    parser.add_argument("--scan-secrets", action="store_true", help="grep for potential secrets before committing")
+    parser.add_argument("--force", action="store_true", help="Proceed even if the tree stays dirty after safeguards")
+    parser.add_argument("--no-auto-commit", action="store_true", help="Skip the pre-sync auto-commit of a dirty tree")
+    parser.add_argument("--smart-filter", action="store_true", help="Use intelligent file analysis to filter irrelevant files")
+    parser.add_argument("--verbose-pii", action="store_true", help="Show detailed PII detection results")
+    parser.add_argument("--analyze-only", action="store_true", help="Run smart analysis and show results without syncing")
+    parser.add_argument("--status", action="store_true", help="Show status of enhanced detection modules")
+    args = parser.parse_args()
+
+    # Handle --status flag
+    if args.status:
+        print("clone v2.2.0 - Enhanced Detection Status")
+        print("=" * 45)
+        print(f"PII Detector:      {'✓ Available' if HAS_PII_DETECTOR else '✗ Not available'}")
+        print(f"Smart Analyzer:    {'✓ Available' if HAS_SMART_ANALYZER else '✗ Not available'}")
+        if HAS_PII_DETECTOR:
+            from pii_detector import PIICategory
+            print(f"  - Categories:    {len(PIICategory)} PII types")
+        if HAS_SMART_ANALYZER:
+            from smart_file_analyzer import FileCategory
+            print(f"  - Categories:    {len(FileCategory)} file types")
+        print(f"\nRepository:        {REPO}")
+        print(f"Config:            {REPO / '.clone.toml'}")
+        sys.exit(0)
+
+    cfg_path = REPO / ".clone.toml"
+    if not cfg_path.exists():
+        print(f"Config missing: {cfg_path}", file=sys.stderr)
+        sys.exit(2)
+
+    global global_cfg
+    config = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
+    global_cfg = config.get("global", {})
+    branch = global_cfg.get("branch", "main")
+    delete_on_repo = bool(global_cfg.get("delete_on_repo", True))
+    write_manifest = bool(global_cfg.get("write_manifest", False))
+    size_cap = None if args.allow_large else global_cfg.get("max_file_size_mb", 15)
+    global_excludes = set(global_cfg.get("global_excludes", []))
+    sources = config.get("source", [])
+    if not sources:
+        print("No [[source]] entries found in .clone.toml", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        git("rev-parse", "--is-inside-work-tree", capture=True)
+    except subprocess.CalledProcessError:
+        print(f"{REPO} is not a git repository", file=sys.stderr)
+        sys.exit(2)
+
+    if args.dry_run:
+        auto_committed = ensure_repo_clean(force=True, auto_commit_enabled=False)
+    else:
+        auto_committed = ensure_repo_clean(force=args.force, auto_commit_enabled=not args.no_auto_commit)
+
+    git("fetch", "origin", "--prune")
+    # Preflight secret scan of the tracked repo if requested
+    if args.scan_secrets:
+        pre_findings = scan_tracked_repo_for_secrets()
+        if pre_findings:
+            print("Potential secrets detected in repository files:")
+            for path, pat in pre_findings[:50]:
+                print(f"  - {path} (matched: {pat})")
+            print("Aborting to prevent pushing secrets. Remove or replace with placeholders and retry.", file=sys.stderr)
+            sys.exit(3)
+    if args.rebase:
+        git("rebase", "--autostash", f"origin/{branch}")
+
+    if args.pr:
+        branch = f"sync/review-{time.strftime('%Y%m%d-%H%M%S')}"
+
+    # Smart analysis mode - analyze sources and optionally filter files
+    smart_filter_enabled = args.smart_filter or bool(global_cfg.get("smart_filter", False))
+    smart_analysis_results: dict[str, dict] = {}
+
+    if args.analyze_only or smart_filter_enabled:
+        print("\n[clone] Running smart file analysis...")
+        for src_cfg in sources:
+            raw_path = src_cfg.get("path", "")
+            source_path = Path(raw_path).expanduser().resolve()
+            if not source_path.exists():
+                continue
+            if source_path.is_dir():
+                analysis = analyze_source_relevance(source_path, verbose=True)
+                smart_analysis_results[str(source_path)] = analysis
+
+        if args.analyze_only:
+            print("\n[clone] Analysis complete (--analyze-only mode, no sync performed)")
+            # Print summary
+            total_relevant = sum(r["analysis_summary"].get("relevant", 0) for r in smart_analysis_results.values())
+            total_excluded = sum(r["analysis_summary"].get("excluded", 0) for r in smart_analysis_results.values())
+            print(f"\nSummary: {total_relevant} relevant files, {total_excluded} excluded files")
+            sys.exit(0)
+
+    rsync_outputs = []
+    dest_paths = []
+
+    for src_cfg in sources:
+        raw_path = src_cfg.get("path", "")
+        source_path = Path(raw_path).expanduser().resolve()
+        dest_rel = src_cfg.get("dest")
+        optional = bool(src_cfg.get("optional", False))
+        local_excludes = set(src_cfg.get("excludes", []))
+        excludes = sorted(global_excludes | local_excludes)
+
+        if not source_path.exists():
+            if optional:
+                continue
+            print(f"Source missing: {source_path}", file=sys.stderr)
+            sys.exit(2)
+
+        if not dest_rel:
+            dest_rel = source_path.name
+        dest_path = (REPO / dest_rel).resolve()
+        enforce_repo_relative(dest_path)
+
+        includes = list(src_cfg.get("includes", []))
+        result = rsync_copy(
+            source_path,
+            dest_path,
+            excludes,
+            dry_run=args.dry_run,
+            size_cap_mb=size_cap,
+            delete=delete_on_repo,
+            includes=includes or None,
+        )
+        rsync_outputs.append(result.stdout.decode("utf-8", "ignore"))
+        dest_paths.append(dest_path if source_path.is_dir() else dest_path)
+
+    # Autodiscover helpers: intelligently mirror selected ~/.local/bin scripts into curated locations
+    auto = global_cfg.get("autodiscover", {})
+    if auto.get("local_bin", False):
+        lb = Path(str(auto.get("local_bin_path", "~/.local/bin")).replace("~", str(Path.home())))
+        if lb.exists() and lb.is_dir():
+            # Rules: each is {type: 'prefix'|'name', value: str, dest: str}
+            rules = auto.get("local_bin_rules", []) or [
+                {"type": "prefix", "value": "omega_", "dest": "monitoring/metrics"},
+                {"type": "name",   "value": "omega_polybar_status", "dest": "monitoring/indicator"},
+                {"type": "name",   "value": "system_panel_indicator.py", "dest": "monitoring/indicator"},
+                {"type": "prefix", "value": "ibg_", "dest": "ops/ibg"},
+                {"type": "name",   "value": "omega_preflight", "dest": "ops"},
+                {"type": "prefix", "value": "opt-", "dest": "tools/options"},
+            ]
+            matched: set[Path] = set()
+            for fp in sorted(lb.iterdir()):
+                if not fp.is_file():
+                    continue
+                name = fp.name
+                dest_dir = None
+                for r in rules:
+                    typ = (r.get("type") or "").lower(); val = r.get("value") or ""; d = r.get("dest")
+                    if not d:
+                        continue
+                    if typ == "name" and name == val:
+                        dest_dir = d; break
+                    if typ == "prefix" and name.startswith(val):
+                        dest_dir = d; break
+                if not dest_dir:
+                    continue
+                dest_path = (REPO / dest_dir / name).resolve()
+                enforce_repo_relative(dest_path)
+                out = rsync_copy(fp, dest_path, excludes=[], dry_run=args.dry_run, size_cap_mb=size_cap, delete=False)
+                if out.stdout:
+                    rsync_outputs.append(out.stdout.decode("utf-8", "ignore"))
+                dest_paths.append(dest_path)
+                matched.add(dest_path)
+
+            # Orphan removal: for files previously mirrored by rules whose local source was removed
+            if not args.dry_run:
+                for rule in rules:
+                    dest_dir = REPO / (rule.get("dest") or "")
+                    if not dest_dir.is_dir():
+                        continue
+                    typ = (rule.get("type") or "").lower(); val = rule.get("value") or ""
+                    for p in dest_dir.iterdir():
+                        if not p.is_file():
+                            continue
+                        name = p.name
+                        ok = (typ == "name" and name == val) or (typ == "prefix" and name.startswith(val))
+                        if not ok:
+                            continue
+                        src = lb / name
+                        if not src.exists():
+                            # remove from git index and working tree
+                            try:
+                                git("rm", str(p.relative_to(REPO)))
+                            except Exception:
+                                pass
+
+    if args.dry_run:
+        print("==== rsync dry-run summaries ====")
+        for output in rsync_outputs:
+            if output.strip():
+                print(output.strip())
+        print("==== end dry-run ====")
+        sys.exit(0)
+
+    if write_manifest:
+        manifest = build_manifest(dest_paths)
+        MANIFEST.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    staged, unstaged = stage_changes_for_commit()
+    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+        if auto_committed:
+            if args.pr:
+                git("checkout", "-B", branch)
+            if args.no_push:
+                print("Auto-commit recorded locally (no push).")
+                sys.exit(0)
+            push_to_origin(branch)
+            print(f"Pushed auto-commit to origin/{branch}")
+            sys.exit(0)
+        if _autopush_enabled() and working_tree_state().strip():
+            print("[clone] No allowlisted changes staged; skipping commit/push.")
+            sys.exit(0)
+        print("No differences detected. Repo already mirrors local sources.")
+        sys.exit(0)
+
+    # Sanitize staged files (PII/secrets) before committing, unless disabled.
+    sanitize_enabled = bool(global_cfg.get("sanitize_secrets", True))
+    if sanitize_enabled:
+        modified = sanitize_staged_files(verbose=args.verbose_pii)
+        if modified:
+            print(f"[clone] Sanitized {len(modified)} file(s) to redact PII/secrets.")
+
+    # If sanitization removed all staged changes, avoid committing.
+    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+        if _autopush_enabled() and working_tree_state().strip():
+            print("[clone] No allowlisted changes staged after sanitization; skipping commit/push.")
+        else:
+            print("[clone] Nothing staged after sanitization; skipping commit/push.")
+        sys.exit(0)
+
+    # Always perform a final staged secret check after sanitization
+    names = git("diff", "--cached", "--name-only", capture=True).stdout.decode().splitlines()
+    staged_findings = scan_paths_for_secrets([REPO / n for n in names])
+    if staged_findings:
+        print("Potential secrets detected in staged files even after sanitization:")
+        for name, pat in staged_findings:
+            print(f"  - {name} (matched pattern: {pat})")
+        print("Aborting commit. Adjust excludes or replace with placeholders and retry.", file=sys.stderr)
+        sys.exit(3)
+
+    diff_stat = git("diff", "--cached", "--stat", capture=True).stdout.decode()
+    commit_message = "clone(sync): reconcile repo with local sources\n\n" + diff_stat
+    git("commit", "-m", commit_message)
+
+    if args.pr:
+        git("checkout", "-B", branch)
+
+    if args.no_push:
+        print("Committed locally (no push).")
+        sys.exit(0)
+
+    push_to_origin(branch)
+    print(f"Pushed to origin/{branch}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("clone aborted by user.", file=sys.stderr)
+        sys.exit(130)

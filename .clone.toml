@@ -1,0 +1,273 @@
+[global]
+max_file_size_mb = 15
+delete_on_repo = true
+write_manifest   = false
+branch           = "main"
+sanitize_secrets = true
+global_excludes = [
+  "*.log",
+  "*.tmp",
+  "*.csv",
+  "*.parquet",
+  "__pycache__",
+  ".git",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ipynb_checkpoints",
+  "ml_env",
+  "venv",
+  ".venv",
+  "node_modules",
+  "*.ibgzenc"
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daemon Configuration (clone-watch-daemon v2.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Event coalescing: wait this long after last event before syncing
+debounce_seconds = 3.0
+
+# Maximum time to wait before syncing even if events keep arriving
+max_debounce_seconds = 30.0
+
+# Retry configuration for failed syncs
+retry_max_attempts = 5
+
+# Pull upstream changes before each sync (handles concurrent edits)
+pull_before_sync = true
+
+# If main is protected, push syncs to a PR branch instead of main.
+pr_on_sync = false
+
+# Health check HTTP server port
+health_port = 9847
+
+# Desktop notifications (requires libnotify)
+notifications = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI-Powered File Detection (requires Ollama)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[ai_detection]
+# Enable AI-powered file discovery
+enabled = true
+
+# Model to use (must be pulled via: ollama pull llama3.2:1b)
+model = "llama3.2:1b"
+
+# Directories to watch for new files (will analyze with AI and add relevant ones)
+watch_directories = [
+    "~/projects",
+    "~/trading",
+    "~/omega",
+    "~/.local/bin",
+    "~/scripts",
+]
+
+# Enable autodiscovery of important local scripts (keeps repo in sync when new tools are added)
+[global.autodiscover]
+local_bin = true
+local_bin_path = "~/.local/bin"
+local_bin_rules = [
+  { type = "name",   value = "omega_polybar_status", dest = "monitoring/indicator" },
+  { type = "prefix", value = "omega_", dest = "monitoring/metrics" },
+  { type = "name",   value = "system_panel_indicator.py", dest = "monitoring/indicator" },
+  { type = "name",   value = "omega_preflight", dest = "ops" },
+  { type = "prefix", value = "opt-", dest = "tools/options" }
+]
+
+# Auto-commit/push policy: only stage + push changes that match this allowlist.
+# (Prevents the daemon from auto-pushing unrelated local edits.)
+[global.autopush]
+enabled = true
+allow_globs = [
+  ".clone.toml",
+  ".gitignore",
+  ".github/**",
+  "AGENTS.md",
+  "README.md",
+  "pyproject.toml",
+  "requirements*.txt",
+  "requirements.lock",
+  "ai_discovered/**",
+  # Tracked, curated experiment/audit artifacts (see .gitignore allowlist exceptions).
+  "data/experiments/**",
+  "data/kb/**",
+  "docs/**",
+  "bin/**",
+  "config/**",
+  "external/**",
+  "features/**",
+  "lib/**",
+  "ml/**",
+  "monitoring/**",
+  "ops/**",
+  "orders/**",
+  "spy_vertical_spread_system/**",
+  "src/**",
+  "tests/**",
+  "tools/**",
+  "trading_system/**",
+  "utils/**",
+  "wfo/**",
+]
+deny_globs = []
+
+[[source]]
+path = "~/configs"
+dest = "external/configs"
+optional = true
+
+# ---- System monitor + trading telemetry (curated files outside the repo) ----
+[[source]]
+path = "~/.local/bin/system_panel_indicator.py"
+dest = "monitoring/indicator/system_panel_indicator.py"
+optional = true
+
+[[source]]
+path = "~/.local/bin/omega_polybar_status"
+dest = "monitoring/indicator/omega_polybar_status"
+optional = true
+
+[[source]]
+path = "~/.local/bin/omega_metrics.py"
+dest = "monitoring/metrics/omega_metrics.py"
+optional = true
+
+[[source]]
+path = "~/.local/bin/omega_options_metrics_writer.py"
+dest = "monitoring/metrics/omega_options_metrics_writer.py"
+optional = true
+
+[[source]]
+path = "~/.local/bin/omega_preflight"
+dest = "ops/omega_preflight"
+optional = true
+
+[[source]]
+path = "~/.local/bin/opt-top3"
+dest = "tools/options/opt-top3"
+optional = true
+
+[[source]]
+path = "~/.local/bin/opt-whatif"
+dest = "tools/options/opt-whatif"
+optional = true
+
+[[source]]
+path = "~/.local/bin/ibg_handshake_probe.sh"
+dest = "ops/ibg/ibg_handshake_probe.sh"
+optional = true
+
+[[source]]
+path = "~/.local/bin/ibg_wait_probe.sh"
+dest = "ops/ibg/ibg_wait_probe.sh"
+optional = true
+
+# ---- WFO window config + validation helpers (curated files outside the repo) ----
+[[source]]
+path = "~/config/wfo_window.py"
+dest = "config/wfo_window.py"
+optional = true
+
+[[source]]
+path = "~/config/wfo_schedule.py"
+dest = "config/wfo_schedule.py"
+optional = true
+
+[[source]]
+path = "~/config/dividends.py"
+dest = "config/dividends.py"
+optional = true
+
+[[source]]
+path = "~/config/nyse_calendar.py"
+dest = "config/nyse_calendar.py"
+optional = true
+
+[[source]]
+path = "~/config/iceberg_catalog.example.yaml"
+dest = "config/iceberg_catalog.example.yaml"
+optional = true
+
+[[source]]
+path = "~/config/wfo_splits_snapshot.json"
+dest = "config/wfo_splits_snapshot.json"
+optional = true
+
+[[source]]
+path = "~/wfo/labeling.py"
+dest = "wfo/labeling.py"
+optional = true
+
+# ---- Options data + quote maintenance helpers (curated tools) ----
+[[source]]
+path = "~/tools/audit_options_tree.py"
+dest = "tools/audit_options_tree.py"
+optional = true
+
+[[source]]
+path = "~/tools/build_options_v3_manifest.py"
+dest = "tools/build_options_v3_manifest.py"
+optional = true
+
+[[source]]
+path = "~/tools/diagnose_no_expiry.py"
+dest = "tools/diagnose_no_expiry.py"
+optional = true
+
+[[source]]
+path = "~/tools/repair_options_quotes.py"
+dest = "tools/repair_options_quotes.py"
+optional = true
+
+[[source]]
+path = "~/tools/validate_spy_data.py"
+dest = "tools/validate_spy_data.py"
+optional = true
+
+# ---- Historical news cache maintenance + feature builders (curated tools) ----
+[[source]]
+path = "~/tools/audit_news_cache.py"
+dest = "tools/news/audit_news_cache.py"
+optional = true
+
+[[source]]
+path = "~/tools/repair_news_cache.py"
+dest = "tools/news/repair_news_cache.py"
+optional = true
+
+[[source]]
+path = "~/tools/build_clean_news_cache.py"
+dest = "tools/news/build_clean_news_cache.py"
+optional = true
+
+[[source]]
+path = "~/tools/build_news_features.py"
+dest = "tools/news/build_news_features.py"
+optional = true
+
+[[source]]
+path = "~/tools/build_market_news_wfo_features.py"
+dest = "tools/news/build_market_news_wfo_features.py"
+optional = true
+
+[[source]]
+path = "~/tools/build_spy_news_wfo_features.py"
+dest = "tools/news/build_spy_news_wfo_features.py"
+optional = true
+
+[[source]]
+path = "~/tools/marketaux_news_daemon.py"
+dest = "tools/news/marketaux_news_daemon.py"
+optional = true
+
+[[source]]
+path = "~/tools/marketaux-newsd.md"
+dest = "docs/marketaux-newsd.md"
+optional = true
+
+## NOTE: Keep strategy-critical scripts inside this repo (source of truth).
+## If you need to mirror external helpers into the repo, add them explicitly here.

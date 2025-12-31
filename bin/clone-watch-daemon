@@ -1,0 +1,1360 @@
+#!/usr/bin/env python3
+"""
+clone-watch-daemon: Production-grade file synchronization daemon for File-Window.
+
+Features:
+- Watchdog-based filesystem monitoring (inotify on Linux)
+- Event coalescing with configurable debounce window
+- Exponential backoff retry with jitter
+- Git conflict detection and auto-resolution
+- Structured JSON logging
+- Desktop notifications (libnotify)
+- Health check endpoint (HTTP)
+- Systemd watchdog integration
+- File locking to prevent concurrent syncs
+- Graceful shutdown with signal handling
+- Metrics collection (Prometheus-compatible)
+
+Usage:
+    ./clone-watch-daemon [--config PATH] [--debug] [--no-notify]
+
+Environment:
+    WATCHDOG_USEC: Systemd watchdog interval (auto-detected)
+    CLONE_WATCH_LOG_LEVEL: Log level (DEBUG, INFO, WARNING, ERROR)
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import http.server
+import json
+import logging
+import os
+import random
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from queue import Empty, Queue
+from typing import Any, Callable
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print("Python 3.11+ required (tomllib stdlib).", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import (
+        FileSystemEventHandler,
+        FileCreatedEvent,
+        FileDeletedEvent,
+        FileModifiedEvent,
+        FileMovedEvent,
+        DirCreatedEvent,
+        DirDeletedEvent,
+        DirModifiedEvent,
+        DirMovedEvent,
+    )
+except ImportError:
+    # NOTE: This module is imported by unit tests to exercise stderr summarization
+    # helpers; don't hard-exit at import time when watchdog isn't installed.
+    # We still fail fast in `main()` when running as an executable.
+    Observer = None  # type: ignore[assignment]
+    FileSystemEventHandler = object  # type: ignore[assignment]
+    FileCreatedEvent = object  # type: ignore[assignment]
+    FileDeletedEvent = object  # type: ignore[assignment]
+    FileModifiedEvent = object  # type: ignore[assignment]
+    FileMovedEvent = object  # type: ignore[assignment]
+    DirCreatedEvent = object  # type: ignore[assignment]
+    DirDeletedEvent = object  # type: ignore[assignment]
+    DirModifiedEvent = object  # type: ignore[assignment]
+    DirMovedEvent = object  # type: ignore[assignment]
+    if __name__ == "__main__":
+        print("watchdog library required: pip install watchdog", file=sys.stderr)
+        sys.exit(2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+VERSION = "2.1.0"
+REPO_DIR = Path(__file__).resolve().parents[1]
+CONFIG_PATH = REPO_DIR / ".clone.toml"
+CLONE_BIN = REPO_DIR / "bin" / "clone"
+LOCK_FILE = REPO_DIR / ".clone-watch.lock"
+STATE_FILE = REPO_DIR / ".clone-watch-state.json"
+METRICS_FILE = REPO_DIR / ".clone-watch-metrics.json"
+LIB_PATH = REPO_DIR / "lib"
+AI_DISCOVERED_DIR = REPO_DIR / "ai_discovered"  # Directory for AI-discovered files
+
+# Add lib to path for AI detection
+if str(LIB_PATH) not in sys.path:
+    sys.path.insert(0, str(LIB_PATH))
+
+# Import AI detector (optional)
+try:
+    from ai_relevance_detector import AIRelevanceDetector, Relevance
+    HAS_AI_DETECTOR = True
+except ImportError:
+    HAS_AI_DETECTOR = False
+    AIRelevanceDetector = None
+    Relevance = None
+
+# Default configuration
+DEFAULT_DEBOUNCE_SECONDS = 3.0
+DEFAULT_MAX_DEBOUNCE_SECONDS = 30.0
+DEFAULT_RETRY_BASE_DELAY = 5.0
+DEFAULT_RETRY_MAX_DELAY = 300.0
+DEFAULT_RETRY_MAX_ATTEMPTS = 5
+DEFAULT_HEALTH_PORT = 9847
+DEFAULT_WATCHDOG_INTERVAL = 30  # seconds
+
+# Patterns to ignore (compiled at startup)
+IGNORE_PATTERNS = {
+    ".git",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ipynb_checkpoints",
+    "node_modules",
+    ".venv",
+    "venv",
+    "ml_env",
+    # Ignore daemon runtime state to avoid self-triggered sync loops.
+    ".clone-watch.lock",
+    ".clone-watch-metrics.json",
+    ".clone-watch-state.json",
+    ".sync_status",
+}
+
+IGNORE_SUFFIXES = {".swp", ".swx", ".tmp", ".pyc", ".pyo", ".log", ".bak", "~"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+class JsonFormatter(logging.Formatter):
+    """JSON log formatter for structured logging."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_obj = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "line": record.lineno,
+        }
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+        if hasattr(record, "extra_data"):
+            log_obj["data"] = record.extra_data
+        return json.dumps(log_obj)
+
+
+def setup_logging(debug: bool = False, json_logs: bool = True) -> logging.Logger:
+    """Configure structured logging."""
+    logger = logging.getLogger("clone-watch")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    # Console handler
+    console = logging.StreamHandler(sys.stdout)
+    if json_logs and not debug:
+        console.setFormatter(JsonFormatter())
+    else:
+        console.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+    logger.addHandler(console)
+
+    # File handler for persistent logs
+    log_dir = Path.home() / "logs"
+    log_dir.mkdir(exist_ok=True)
+    file_handler = logging.FileHandler(log_dir / "clone-watch.log")
+    file_handler.setFormatter(JsonFormatter())
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Desktop Notifications
+# ─────────────────────────────────────────────────────────────────────────────
+
+def notify(title: str, message: str, urgency: str = "normal", icon: str = "dialog-information") -> bool:
+    """Send desktop notification using libnotify."""
+    try:
+        subprocess.run(
+            ["notify-send", "-u", urgency, "-i", icon, "-a", "clone-watch", title, message],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def summarize_clone_stderr(stderr: str, *, max_chars: int = 200) -> str:
+    """
+    Extract a short, high-signal error summary from `bin/clone` stderr.
+
+    clone emits some informational warnings (e.g., autopush allowlist notes) on stderr,
+    and Python tracebacks can be long. For desktop notifications, prefer the root cause.
+    """
+    if not stderr:
+        return "Unknown error (no stderr)"
+
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    if not lines:
+        return "Unknown error (empty stderr)"
+
+    def is_noise(line: str) -> bool:
+        return (
+            line.startswith("[clone] Note:")
+            or line.startswith("Traceback (most recent call last):")
+            or line.startswith("File \"")
+        )
+
+    filtered = [ln for ln in lines if not is_noise(ln)]
+
+    preferred_substrings = [
+        "Permission denied (publickey)",
+        "Repository not found",
+        "Could not read from remote repository",
+        "Unable to create",
+        "index.lock",
+        "Host key verification failed",
+        "fatal:",
+        "error:",
+    ]
+    for needle in preferred_substrings:
+        for ln in filtered:
+            if needle in ln:
+                return ln[:max_chars]
+
+    # Fall back to last non-noise line, else last raw line.
+    if filtered:
+        return filtered[-1][:max_chars]
+    return lines[-1][:max_chars]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metrics & State
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Metrics:
+    """Metrics collection for monitoring."""
+
+    syncs_total: int = 0
+    syncs_success: int = 0
+    syncs_failed: int = 0
+    events_received: int = 0
+    events_coalesced: int = 0
+    last_sync_timestamp: float = 0.0
+    last_sync_duration: float = 0.0
+    last_sync_success: bool = True
+    consecutive_failures: int = 0
+    uptime_start: float = field(default_factory=time.time)
+    files_changed: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "syncs_total": self.syncs_total,
+            "syncs_success": self.syncs_success,
+            "syncs_failed": self.syncs_failed,
+            "sync_success_rate": (
+                self.syncs_success / self.syncs_total if self.syncs_total > 0 else 1.0
+            ),
+            "events_received": self.events_received,
+            "events_coalesced": self.events_coalesced,
+            "last_sync_timestamp": self.last_sync_timestamp,
+            "last_sync_duration_seconds": self.last_sync_duration,
+            "last_sync_success": self.last_sync_success,
+            "consecutive_failures": self.consecutive_failures,
+            "uptime_seconds": time.time() - self.uptime_start,
+            "files_changed": self.files_changed,
+        }
+
+    def to_prometheus(self) -> str:
+        """Export metrics in Prometheus format."""
+        lines = [
+            f'# HELP clone_watch_syncs_total Total sync attempts',
+            f'# TYPE clone_watch_syncs_total counter',
+            f'clone_watch_syncs_total {self.syncs_total}',
+            f'# HELP clone_watch_syncs_success Successful syncs',
+            f'# TYPE clone_watch_syncs_success counter',
+            f'clone_watch_syncs_success {self.syncs_success}',
+            f'# HELP clone_watch_syncs_failed Failed syncs',
+            f'# TYPE clone_watch_syncs_failed counter',
+            f'clone_watch_syncs_failed {self.syncs_failed}',
+            f'# HELP clone_watch_events_total Events received',
+            f'# TYPE clone_watch_events_total counter',
+            f'clone_watch_events_total {self.events_received}',
+            f'# HELP clone_watch_last_sync_timestamp Last sync unix timestamp',
+            f'# TYPE clone_watch_last_sync_timestamp gauge',
+            f'clone_watch_last_sync_timestamp {self.last_sync_timestamp}',
+            f'# HELP clone_watch_consecutive_failures Current failure streak',
+            f'# TYPE clone_watch_consecutive_failures gauge',
+            f'clone_watch_consecutive_failures {self.consecutive_failures}',
+            f'# HELP clone_watch_uptime_seconds Daemon uptime',
+            f'# TYPE clone_watch_uptime_seconds gauge',
+            f'clone_watch_uptime_seconds {time.time() - self.uptime_start}',
+        ]
+        return '\n'.join(lines) + '\n'
+
+    def save(self) -> None:
+        """Persist metrics to disk."""
+        try:
+            METRICS_FILE.write_text(json.dumps(self.to_dict(), indent=2))
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File Locking
+# ─────────────────────────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def file_lock(lock_path: Path, timeout: float = 30.0):
+    """Acquire exclusive file lock with timeout."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_path, "w")
+    start = time.time()
+    acquired = False
+
+    while time.time() - start < timeout:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except BlockingIOError:
+            time.sleep(0.1)
+
+    if not acquired:
+        lock_fd.close()
+        raise TimeoutError(f"Could not acquire lock on {lock_path} within {timeout}s")
+
+    lock_fd.write(f"{os.getpid()}\n{datetime.now(timezone.utc).isoformat()}\n")
+    lock_fd.flush()
+
+    try:
+        yield lock_fd
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        try:
+            lock_path.unlink()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Retry Logic with Exponential Backoff
+# ─────────────────────────────────────────────────────────────────────────────
+
+def exponential_backoff(
+    attempt: int,
+    base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+    max_delay: float = DEFAULT_RETRY_MAX_DELAY,
+    jitter: float = 0.3,
+) -> float:
+    """Calculate delay with exponential backoff and jitter."""
+    delay = min(base_delay * (2 ** attempt), max_delay)
+    # Add random jitter to prevent thundering herd
+    jitter_range = delay * jitter
+    delay += random.uniform(-jitter_range, jitter_range)
+    return max(0, delay)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Git Operations
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GitOperations:
+    """Git operations with conflict detection and resolution."""
+
+    def __init__(self, repo_dir: Path, logger: logging.Logger):
+        self.repo_dir = repo_dir
+        self.logger = logger
+
+    def run(self, *args: str, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+        """Run git command."""
+        cmd = ["git", "-C", str(self.repo_dir), *args]
+        return subprocess.run(
+            cmd,
+            check=check,
+            capture_output=capture,
+            text=True,
+            timeout=120,
+        )
+
+    def is_clean(self) -> bool:
+        """Check if working tree is clean."""
+        result = self.run("status", "--porcelain", check=False)
+        return not result.stdout.strip()
+
+    def has_upstream_changes(self, branch: str = "main") -> bool:
+        """Check if upstream has new commits."""
+        try:
+            self.run("fetch", "origin", "--prune")
+            result = self.run("rev-list", f"HEAD..origin/{branch}", "--count")
+            return int(result.stdout.strip()) > 0
+        except Exception:
+            return False
+
+    def pull_rebase_autostash(self, branch: str = "main") -> bool:
+        """Pull upstream changes with rebase and autostash."""
+        try:
+            self.run("pull", "--rebase", "--autostash", "origin", branch)
+            return True
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Pull rebase failed: {e.stderr}")
+            # Abort rebase if in progress
+            try:
+                self.run("rebase", "--abort", check=False)
+            except Exception:
+                pass
+            return False
+
+    def get_current_branch(self) -> str:
+        """Get current branch name."""
+        result = self.run("rev-parse", "--abbrev-ref", "HEAD")
+        return result.stdout.strip()
+
+    def get_remote_url(self) -> str:
+        """Get remote origin URL."""
+        try:
+            result = self.run("remote", "get-url", "origin")
+            return result.stdout.strip()
+        except Exception:
+            return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Event Handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CoalescingEventHandler(FileSystemEventHandler):
+    """
+    File system event handler with intelligent event coalescing.
+
+    Events are collected and deduplicated during a quiet period before
+    triggering a sync. This prevents burst syncs during rapid file changes.
+    """
+
+    def __init__(
+        self,
+        event_queue: Queue,
+        logger: logging.Logger,
+        metrics: Metrics,
+        debounce_seconds: float = DEFAULT_DEBOUNCE_SECONDS,
+    ):
+        super().__init__()
+        self.event_queue = event_queue
+        self.logger = logger
+        self.metrics = metrics
+        self.debounce_seconds = debounce_seconds
+        self._pending_events: dict[str, tuple[str, float]] = {}
+        self._lock = threading.Lock()
+
+    def _should_ignore(self, path: str) -> bool:
+        """Check if path should be ignored."""
+        p = Path(path)
+
+        # Check ignore patterns in path components
+        for part in p.parts:
+            if part in IGNORE_PATTERNS:
+                return True
+
+        # Check suffixes
+        if p.suffix in IGNORE_SUFFIXES:
+            return True
+
+        # Check for hidden files starting with .#
+        if p.name.startswith(".#"):
+            return True
+
+        # Common editor temp artifacts like foo.py.tmp.12345 (suffix won't be ".tmp")
+        lower_name = p.name.lower()
+        if ".tmp." in lower_name:
+            return True
+
+        return False
+
+    def _process_event(self, event) -> None:
+        """Process a filesystem event."""
+        # Directory events are extremely noisy (and frequently self-triggered).
+        # File events are sufficient for sync correctness.
+        if getattr(event, "is_directory", False):
+            return
+
+        path = event.src_path if hasattr(event, "src_path") else str(event)
+
+        if self._should_ignore(path):
+            return
+
+        self.metrics.events_received += 1
+        event_type = type(event).__name__
+
+        with self._lock:
+            # Coalesce events for the same path
+            if path in self._pending_events:
+                self.metrics.events_coalesced += 1
+            self._pending_events[path] = (event_type, time.time())
+
+        self.logger.debug(f"Event: {event_type} on {path}")
+
+        # Signal debouncer
+        self.event_queue.put(("event", path, event_type))
+
+    def on_created(self, event):
+        self._process_event(event)
+
+    def on_deleted(self, event):
+        self._process_event(event)
+
+    def on_modified(self, event):
+        self._process_event(event)
+
+    def on_moved(self, event):
+        self._process_event(event)
+
+    def get_pending_events(self) -> dict[str, tuple[str, float]]:
+        """Get and clear pending events."""
+        with self._lock:
+            events = self._pending_events.copy()
+            self._pending_events.clear()
+            return events
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI-Powered File Discovery Handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AIFileDiscoveryHandler(FileSystemEventHandler):
+    """
+    Watches external directories and uses AI to detect relevant files.
+
+    When a new file is created in watched directories, this handler:
+    1. Checks if the file type is analyzable
+    2. Runs AI analysis to determine relevance
+    3. If relevant, copies the file to the ai_discovered directory
+    4. The main clone system then syncs the discovered files to GitHub
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        metrics: Metrics,
+        ai_detector: "AIRelevanceDetector | None" = None,
+    ):
+        super().__init__()
+        self.logger = logger
+        self.metrics = metrics
+        self.ai_detector = ai_detector
+        self._pending_analysis: Queue = Queue()
+        self._analysis_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+        # Ensure ai_discovered directory exists
+        AI_DISCOVERED_DIR.mkdir(parents=True, exist_ok=True)
+
+    def start_analysis_worker(self):
+        """Start background thread for AI analysis."""
+        if self._analysis_thread is not None:
+            return
+        self._stop_event.clear()
+        self._analysis_thread = threading.Thread(
+            target=self._analysis_worker,
+            daemon=True,
+            name="ai-analysis-worker",
+        )
+        self._analysis_thread.start()
+        self.logger.info("AI analysis worker started")
+
+    def stop_analysis_worker(self):
+        """Stop the analysis worker."""
+        self._stop_event.set()
+        self._pending_analysis.put(None)  # Unblock the queue
+        if self._analysis_thread:
+            self._analysis_thread.join(timeout=5)
+            self._analysis_thread = None
+
+    def _analysis_worker(self):
+        """Background worker that processes files for AI analysis."""
+        while not self._stop_event.is_set():
+            try:
+                item = self._pending_analysis.get(timeout=1.0)
+                if item is None:
+                    continue
+                filepath = Path(item)
+                self._analyze_and_copy(filepath)
+            except Empty:
+                continue
+            except Exception as e:
+                self.logger.error(f"AI analysis error: {e}")
+
+    def _should_analyze(self, path: str) -> bool:
+        """Check if file should be analyzed."""
+        p = Path(path)
+
+        # Skip if not a file
+        if not p.is_file():
+            return False
+
+        # Skip ignored patterns
+        for part in p.parts:
+            if part in IGNORE_PATTERNS:
+                return False
+
+        # Skip ignored suffixes
+        if p.suffix in IGNORE_SUFFIXES:
+            return False
+
+        # Only analyze code/config files
+        analyzable = {'.py', '.pyi', '.js', '.ts', '.yaml', '.yml', '.toml', '.json', '.sh'}
+        if p.suffix.lower() not in analyzable:
+            return False
+
+        return True
+
+    def _analyze_and_copy(self, filepath: Path):
+        """
+        Analyze a file and copy if relevant.
+
+        GPU is only used during this analysis and is immediately released after.
+        """
+        if self.ai_detector is None:
+            return
+
+        try:
+            # Check if Ollama is available (lazy check on first actual use)
+            if not self.ai_detector.client.is_available():
+                self.logger.warning(
+                    f"Skipping AI analysis for {filepath.name}: Ollama not running"
+                )
+                return
+
+            self.logger.debug(f"AI analyzing new file: {filepath.name} (GPU loading model...)")
+            result = self.ai_detector.analyze_file(filepath)
+            self.logger.debug(f"AI analysis complete: {filepath.name} (GPU unloading model)")
+
+            if result.relevance == Relevance.RELEVANT:
+                # Copy to ai_discovered directory
+                dest = AI_DISCOVERED_DIR / filepath.name
+
+                # Handle name conflicts
+                counter = 1
+                while dest.exists():
+                    stem = filepath.stem
+                    suffix = filepath.suffix
+                    dest = AI_DISCOVERED_DIR / f"{stem}_{counter}{suffix}"
+                    counter += 1
+
+                # Copy the file
+                import shutil
+                shutil.copy2(filepath, dest)
+
+                self.logger.info(
+                    f"AI discovered relevant file: {filepath.name} -> {dest}",
+                    extra={"confidence": result.confidence, "reason": result.reason},
+                )
+            else:
+                self.logger.debug(
+                    f"AI: {filepath.name} not relevant ({result.relevance.value}, "
+                    f"confidence={result.confidence:.0%})"
+                )
+
+        except Exception as e:
+            self.logger.error(f"Failed to analyze {filepath}: {e}")
+
+    def on_created(self, event):
+        """Handle file creation events."""
+        if event.is_directory:
+            return
+
+        path = event.src_path
+        if self._should_analyze(path):
+            self.logger.debug(f"Queuing for AI analysis: {path}")
+            self._pending_analysis.put(path)
+
+    def on_moved(self, event):
+        """Handle file move/rename events (common for atomic writes)."""
+        if event.is_directory:
+            return
+
+        dest_path = getattr(event, "dest_path", None)
+        if not dest_path:
+            return
+
+        if self._should_analyze(dest_path):
+            self.logger.debug(f"Queuing for AI analysis (moved): {dest_path}")
+            self._pending_analysis.put(dest_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Health Check Server
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP handler for health checks and metrics."""
+
+    daemon = None  # Set by server
+    metrics = None  # Set by server
+
+    def log_message(self, format, *args):
+        pass  # Suppress access logs
+
+    def do_GET(self):
+        if self.path == "/health" or self.path == "/healthz":
+            self._respond_health()
+        elif self.path == "/metrics":
+            self._respond_metrics()
+        elif self.path == "/status":
+            self._respond_status()
+        else:
+            self.send_error(404)
+
+    def _respond_health(self):
+        healthy = self.metrics.consecutive_failures < 3
+        status = 200 if healthy else 503
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(
+            json.dumps({
+                "status": "healthy" if healthy else "unhealthy",
+                "consecutive_failures": self.metrics.consecutive_failures,
+                "last_sync": self.metrics.last_sync_timestamp,
+            }).encode()
+        )
+
+    def _respond_metrics(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.end_headers()
+        self.wfile.write(self.metrics.to_prometheus().encode())
+
+    def _respond_status(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        status = {
+            "version": VERSION,
+            "uptime_seconds": time.time() - self.metrics.uptime_start,
+            "metrics": self.metrics.to_dict(),
+            "repo_dir": str(REPO_DIR),
+            "config_path": str(CONFIG_PATH),
+        }
+        self.wfile.write(json.dumps(status, indent=2).encode())
+
+
+class HealthCheckServer(socketserver.ThreadingTCPServer):
+    """Threaded health check server."""
+
+    allow_reuse_address = True
+
+    def __init__(self, port: int, metrics: Metrics):
+        HealthCheckHandler.metrics = metrics
+        try:
+            super().__init__(("127.0.0.1", port), HealthCheckHandler)
+        except OSError:
+            # Port in use, try next
+            super().__init__(("127.0.0.1", port + 1), HealthCheckHandler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Systemd Watchdog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SystemdWatchdog:
+    """Systemd watchdog integration."""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.enabled = False
+        self.interval = 0
+
+        # Check if running under systemd with watchdog enabled
+        watchdog_usec = os.environ.get("WATCHDOG_USEC")
+        if watchdog_usec:
+            try:
+                self.interval = int(watchdog_usec) / 1_000_000 / 2  # Ping at half interval
+                self.enabled = True
+                self.logger.info(f"Systemd watchdog enabled, ping interval: {self.interval:.1f}s")
+            except ValueError:
+                pass
+
+    def notify_ready(self):
+        """Notify systemd that service is ready."""
+        if self.enabled:
+            self._notify("READY=1")
+
+    def notify_stopping(self):
+        """Notify systemd that service is stopping."""
+        if self.enabled:
+            self._notify("STOPPING=1")
+
+    def ping(self):
+        """Send watchdog ping."""
+        if self.enabled:
+            self._notify("WATCHDOG=1")
+
+    def notify_status(self, status: str):
+        """Update service status in systemd."""
+        if self.enabled:
+            self._notify(f"STATUS={status}")
+
+    def _notify(self, message: str):
+        """Send notification to systemd."""
+        try:
+            notify_socket = os.environ.get("NOTIFY_SOCKET")
+            if not notify_socket:
+                return
+
+            if notify_socket.startswith("@"):
+                notify_socket = "\0" + notify_socket[1:]
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            try:
+                sock.connect(notify_socket)
+                sock.sendall(message.encode())
+            finally:
+                sock.close()
+        except Exception as e:
+            self.logger.debug(f"Systemd notify failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Daemon
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CloneWatchDaemon:
+    """Main daemon coordinating file watching and synchronization."""
+
+    def __init__(
+        self,
+        config_path: Path = CONFIG_PATH,
+        debug: bool = False,
+        notifications: bool = True,
+        health_port: int = DEFAULT_HEALTH_PORT,
+    ):
+        self.config_path = config_path
+        self.debug = debug
+        self.notifications = notifications
+        self.health_port = health_port
+
+        # State
+        self.running = True
+        self.metrics = Metrics()
+        self.event_queue: Queue = Queue()
+
+        # Setup logging
+        self.logger = setup_logging(debug=debug, json_logs=not debug)
+        self.logger.info(f"clone-watch-daemon v{VERSION} starting")
+
+        # Load configuration
+        self.config = self._load_config()
+        # Config can disable notifications; CLI can also force-disable via --no-notify.
+        self.notifications = bool(self.notifications) and bool(self.config.get("notifications", True))
+        # Config can override health port.
+        try:
+            self.health_port = int(self.config.get("health_port", self.health_port))
+        except Exception:
+            pass
+        self.watch_paths = self._resolve_watch_paths()
+
+        # Initialize components
+        self.git = GitOperations(REPO_DIR, self.logger)
+        self.watchdog = SystemdWatchdog(self.logger)
+        self.observer = Observer()
+        self.event_handler = CoalescingEventHandler(
+            self.event_queue,
+            self.logger,
+            self.metrics,
+            debounce_seconds=self.config.get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS),
+        )
+
+        # AI-powered file discovery (optional)
+        self.ai_detector = None
+        self.ai_handler = None
+        self.ai_observer = None
+        self._setup_ai_detection()
+
+        # Health server (started later)
+        self.health_server = None
+        self.health_thread = None
+
+        # Watchdog ping thread
+        self.watchdog_thread = None
+
+    def _setup_ai_detection(self):
+        """
+        Initialize AI-powered file detection if available and configured.
+
+        NOTE: Ollama availability is NOT checked at startup to prevent GPU usage.
+        The check is deferred until a file actually needs analysis. If Ollama is
+        not available when a file is analyzed, it will fail gracefully.
+        """
+        if not HAS_AI_DETECTOR:
+            self.logger.info("AI detector not available (module not installed)")
+            return
+
+        ai_config = self.config.get("ai_detection", {})
+        if not ai_config.get("enabled", False):
+            self.logger.debug("AI detection disabled in config")
+            return
+
+        try:
+            # Create detector with lazy initialization - does NOT contact Ollama yet
+            # GPU is only used when a new file is actually created and needs analysis
+            model = ai_config.get("model")
+            self.ai_detector = AIRelevanceDetector(
+                model=model or "llama3.2:1b",
+                keep_alive=0,  # Unload model from GPU immediately after each analysis
+            )
+
+            self.ai_handler = AIFileDiscoveryHandler(
+                logger=self.logger,
+                metrics=self.metrics,
+                ai_detector=self.ai_detector,
+            )
+            self.ai_observer = Observer()
+
+            # Watch AI-configured directories
+            ai_watch_dirs = ai_config.get("watch_directories", [])
+            watched_count = 0
+            for dir_path in ai_watch_dirs:
+                path = Path(dir_path).expanduser().resolve()
+                if path.exists() and path.is_dir():
+                    self.ai_observer.schedule(self.ai_handler, str(path), recursive=True)
+                    self.logger.info(f"AI watching directory: {path}")
+                    watched_count += 1
+
+            self.logger.info(
+                f"AI detection enabled ({watched_count} directories). "
+                f"GPU used only on new file creation, model unloads immediately after analysis."
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize AI detection: {e}")
+            self.ai_detector = None
+            self.ai_handler = None
+
+    def _load_config(self) -> dict:
+        """Load and parse configuration."""
+        if not self.config_path.exists():
+            self.logger.error(f"Config not found: {self.config_path}")
+            sys.exit(2)
+
+        config = tomllib.loads(self.config_path.read_text(encoding="utf-8"))
+        global_cfg = config.get("global", {})
+
+        def _pick(key: str, default):
+            if key in config:
+                return config.get(key, default)
+            return global_cfg.get(key, default)
+
+        return {
+            "branch": global_cfg.get("branch", "main"),
+            "sources": config.get("source", []),
+            "global_excludes": set(global_cfg.get("global_excludes", [])),
+            "debounce_seconds": _pick("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS),
+            "max_debounce_seconds": _pick("max_debounce_seconds", DEFAULT_MAX_DEBOUNCE_SECONDS),
+            "retry_max_attempts": _pick("retry_max_attempts", DEFAULT_RETRY_MAX_ATTEMPTS),
+            "pull_before_sync": _pick("pull_before_sync", True),
+            "pr_on_sync": _pick("pr_on_sync", False),
+            "health_port": _pick("health_port", DEFAULT_HEALTH_PORT),
+            "notifications": _pick("notifications", True),
+            "autodiscover": global_cfg.get("autodiscover", {}),
+            "ai_detection": config.get("ai_detection", {}),
+        }
+
+    def _resolve_watch_paths(self) -> list[Path]:
+        """Resolve all paths to watch from configuration."""
+        paths = set()
+
+        # Add configured sources
+        for source in self.config["sources"]:
+            raw_path = source.get("path", "")
+            if not raw_path:
+                continue
+
+            path = Path(raw_path).expanduser().resolve()
+            optional = source.get("optional", False)
+
+            if not path.exists():
+                if not optional:
+                    self.logger.warning(f"Source path not found: {path}")
+                continue
+
+            # Watch directories directly, files watch parent
+            watch_path = path if path.is_dir() else path.parent
+            paths.add(watch_path)
+
+        # Add autodiscovery paths
+        auto = self.config.get("autodiscover", {})
+        if auto.get("local_bin", False):
+            local_bin = Path(auto.get("local_bin_path", "~/.local/bin")).expanduser()
+            if local_bin.exists():
+                paths.add(local_bin)
+
+        # Always watch the repo itself for in-place edits
+        paths.add(REPO_DIR)
+
+        return sorted(paths)
+
+    def _setup_signal_handlers(self):
+        """Setup graceful shutdown handlers."""
+        def shutdown_handler(signum, frame):
+            sig_name = signal.Signals(signum).name
+            self.logger.info(f"Received {sig_name}, initiating graceful shutdown")
+            self.running = False
+            self.event_queue.put(("shutdown", None, None))
+
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        signal.signal(signal.SIGINT, shutdown_handler)
+        signal.signal(signal.SIGHUP, lambda s, f: self._reload_config())
+
+    def _reload_config(self):
+        """Reload configuration on SIGHUP."""
+        self.logger.info("Reloading configuration")
+        try:
+            self.config = self._load_config()
+            new_paths = self._resolve_watch_paths()
+
+            # TODO: Update observer with new paths
+            self.logger.info(f"Configuration reloaded, {len(new_paths)} watch paths")
+        except Exception as e:
+            self.logger.error(f"Config reload failed: {e}")
+
+    def _start_health_server(self):
+        """Start health check HTTP server."""
+        try:
+            self.health_server = HealthCheckServer(self.health_port, self.metrics)
+            self.health_thread = threading.Thread(
+                target=self.health_server.serve_forever,
+                daemon=True,
+                name="health-server",
+            )
+            self.health_thread.start()
+            self.logger.info(f"Health server listening on http://127.0.0.1:{self.health_port}")
+        except Exception as e:
+            self.logger.warning(f"Could not start health server: {e}")
+
+    def _start_watchdog_pinger(self):
+        """Start systemd watchdog ping thread."""
+        if not self.watchdog.enabled:
+            return
+
+        def ping_loop():
+            while self.running:
+                self.watchdog.ping()
+                time.sleep(self.watchdog.interval)
+
+        self.watchdog_thread = threading.Thread(
+            target=ping_loop,
+            daemon=True,
+            name="watchdog-pinger",
+        )
+        self.watchdog_thread.start()
+
+    def _start_observer(self):
+        """Start filesystem observer."""
+        for path in self.watch_paths:
+            self.logger.info(f"Watching: {path}")
+            self.observer.schedule(self.event_handler, str(path), recursive=True)
+
+        self.observer.start()
+
+    def _sync_with_retry(self) -> bool:
+        """Execute sync with exponential backoff retry."""
+        max_attempts = self.config.get("retry_max_attempts", DEFAULT_RETRY_MAX_ATTEMPTS)
+
+        for attempt in range(max_attempts):
+            try:
+                success = self._execute_sync()
+                if success:
+                    self.metrics.consecutive_failures = 0
+                    return True
+
+                self.metrics.consecutive_failures += 1
+
+            except Exception as e:
+                self.logger.error(f"Sync attempt {attempt + 1} failed: {e}")
+                self.metrics.consecutive_failures += 1
+
+            if attempt < max_attempts - 1:
+                delay = exponential_backoff(attempt)
+                self.logger.info(f"Retrying in {delay:.1f}s (attempt {attempt + 2}/{max_attempts})")
+                time.sleep(delay)
+
+        self.logger.error(f"Sync failed after {max_attempts} attempts")
+        return False
+
+    def _execute_sync(self) -> bool:
+        """Execute the actual sync operation."""
+        start_time = time.time()
+        self.metrics.syncs_total += 1
+
+        self.watchdog.notify_status("Syncing...")
+
+        # Check for upstream changes first
+        branch = self.config.get("branch", "main")
+        if self.config.get("pull_before_sync", True) and self.git.has_upstream_changes(branch):
+            self.logger.info("Upstream changes detected, pulling with rebase")
+            if not self.git.pull_rebase_autostash(branch):
+                self.logger.warning("Pull rebase failed, proceeding with local sync")
+
+        # Execute clone tool
+        try:
+            with file_lock(LOCK_FILE, timeout=60):
+                clone_cmd = [str(CLONE_BIN), "--push", "--scan-secrets", "--force"]
+                if self.config.get("pr_on_sync", False):
+                    clone_cmd.append("--pr")
+                result = subprocess.run(
+                    clone_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    cwd=REPO_DIR,
+                )
+
+                duration = time.time() - start_time
+                self.metrics.last_sync_duration = duration
+                self.metrics.last_sync_timestamp = time.time()
+
+                if result.returncode == 0:
+                    self.metrics.syncs_success += 1
+                    self.metrics.last_sync_success = True
+                    self.logger.info(f"Sync completed in {duration:.2f}s")
+                    self.watchdog.notify_status(f"Last sync: {datetime.now().strftime('%H:%M:%S')}")
+
+                    if self.notifications:
+                        notify(
+                            "File-Window Synced",
+                            f"Changes pushed to GitHub in {duration:.1f}s",
+                            icon="git",
+                        )
+                    return True
+                else:
+                    self.metrics.syncs_failed += 1
+                    self.metrics.last_sync_success = False
+                    self.logger.error(f"Clone failed: {result.stderr}")
+
+                    if self.notifications:
+                        summary = summarize_clone_stderr(result.stderr)
+                        notify(
+                            "File-Window Sync Failed",
+                            f"Error: {summary}",
+                            urgency="critical",
+                            icon="dialog-error",
+                        )
+                    return False
+
+        except TimeoutError as e:
+            self.logger.error(f"Could not acquire lock: {e}")
+            return False
+        except subprocess.TimeoutExpired:
+            self.logger.error("Clone command timed out")
+            return False
+
+    def _debounce_loop(self):
+        """Main loop: wait for events, debounce, then sync."""
+        debounce = self.config.get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS)
+        max_debounce = self.config.get("max_debounce_seconds", DEFAULT_MAX_DEBOUNCE_SECONDS)
+        last_event_time = 0
+        first_event_time = 0
+        pending = False
+
+        while self.running:
+            try:
+                # Wait for event with timeout
+                timeout = debounce if pending else None
+                try:
+                    msg_type, path, event_type = self.event_queue.get(timeout=timeout)
+                except Empty:
+                    msg_type = "timeout"
+
+                if msg_type == "shutdown":
+                    break
+
+                if msg_type == "event":
+                    now = time.time()
+                    if not pending:
+                        first_event_time = now
+                    last_event_time = now
+                    pending = True
+                    continue
+
+                if msg_type == "timeout" and pending:
+                    now = time.time()
+                    time_since_last = now - last_event_time
+                    time_since_first = now - first_event_time
+
+                    # Sync if quiet period elapsed or max debounce reached
+                    if time_since_last >= debounce or time_since_first >= max_debounce:
+                        events = self.event_handler.get_pending_events()
+                        if events:
+                            self.metrics.files_changed += len(events)
+                            # Log a small sample of event paths at INFO to help diagnose
+                            # self-triggered sync loops (e.g., runtime lock/metrics files).
+                            sample_paths = sorted(events.keys())[:8]
+                            sample_display: list[str] = []
+                            for p in sample_paths:
+                                try:
+                                    pp = Path(p)
+                                    sample_display.append(str(pp.relative_to(REPO_DIR)))
+                                except Exception:
+                                    sample_display.append(p)
+                            suffix = ""
+                            if len(events) > len(sample_paths):
+                                suffix = f" (+{len(events) - len(sample_paths)} more)"
+                            self.logger.info(
+                                f"Processing {len(events)} coalesced events: "
+                                + ", ".join(sample_display)
+                                + suffix
+                            )
+                            self._sync_with_retry()
+                        pending = False
+                        first_event_time = 0
+
+            except Exception as e:
+                self.logger.error(f"Debounce loop error: {e}", exc_info=True)
+                time.sleep(1)
+
+    def run(self):
+        """Main entry point."""
+        self._setup_signal_handlers()
+        self._start_health_server()
+        self._start_watchdog_pinger()
+        self._start_observer()
+        self._start_ai_observer()
+
+        ai_status = " (AI detection active)" if self.ai_handler else ""
+        self.logger.info(f"Monitoring {len(self.watch_paths)} paths{ai_status}")
+        self.watchdog.notify_ready()
+        self.watchdog.notify_status("Watching for changes")
+
+        if self.notifications:
+            notify(
+                "Clone Watch Started",
+                f"Monitoring {len(self.watch_paths)} paths{ai_status}",
+                icon="git",
+            )
+
+        try:
+            self._debounce_loop()
+        finally:
+            self.shutdown()
+
+    def _start_ai_observer(self):
+        """Start the AI file discovery observer if configured."""
+        if self.ai_handler and self.ai_observer:
+            self.ai_handler.start_analysis_worker()
+            self.ai_observer.start()
+            self.logger.info("AI file discovery observer started")
+
+    def shutdown(self):
+        """Graceful shutdown."""
+        self.logger.info("Shutting down...")
+        self.watchdog.notify_stopping()
+        self.running = False
+
+        # Stop main observer
+        if self.observer.is_alive():
+            self.observer.stop()
+            self.observer.join(timeout=5)
+
+        # Stop AI observer and handler
+        if self.ai_observer and self.ai_observer.is_alive():
+            self.ai_observer.stop()
+            self.ai_observer.join(timeout=5)
+        if self.ai_handler:
+            self.ai_handler.stop_analysis_worker()
+
+        # Stop health server
+        if self.health_server:
+            self.health_server.shutdown()
+
+        # Save final metrics
+        self.metrics.save()
+
+        self.logger.info("Shutdown complete")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Production-grade file sync daemon for File-Window",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=CONFIG_PATH,
+        help="Path to .clone.toml config file",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (human-readable format)",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="Disable desktop notifications",
+    )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=DEFAULT_HEALTH_PORT,
+        help=f"Health check HTTP port (default: {DEFAULT_HEALTH_PORT})",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"clone-watch-daemon {VERSION}",
+    )
+
+    args = parser.parse_args()
+
+    daemon = CloneWatchDaemon(
+        config_path=args.config,
+        debug=args.debug,
+        notifications=not args.no_notify,
+        health_port=args.health_port,
+    )
+
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.getLogger("clone-watch").critical(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

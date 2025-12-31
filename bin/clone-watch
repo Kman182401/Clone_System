@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Debounced watcher that triggers repo sync on local changes to configured sources.
+# Requires: inotifywait (inotify-tools), Python 3.11+
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLONE="${REPO_DIR}/bin/clone"
+CFG="${REPO_DIR}/.clone.toml"
+
+if ! command -v inotifywait >/dev/null 2>&1; then
+  echo "inotifywait (inotify-tools) is required." >&2
+  exit 2
+fi
+
+# Extract watch paths from .clone.toml using Python + tomllib for correctness
+mapfile -t WATCH_PATHS < <(python3 - "${CFG}" <<'PY'
+import sys, tomllib, os
+from pathlib import Path
+cfg_path = Path(sys.argv[1])
+cfg = cfg_path.read_text(encoding='utf-8')
+conf = tomllib.loads(cfg)
+paths = []
+for s in conf.get('source', []):
+    p = s.get('path'); optional = bool(s.get('optional', False))
+    if not p: continue
+    P = Path(os.path.expanduser(p))
+    if not P.exists() and optional:
+        continue
+    # Watch directories recursively; for files, watch parent dir
+    paths.append(str(P if P.is_dir() else P.parent))
+print("\n".join(dict.fromkeys(paths)))
+PY
+)
+
+PR_ON_SYNC="$(python3 - "${CFG}" <<'PY'
+import sys, tomllib
+from pathlib import Path
+cfg_path = Path(sys.argv[1])
+conf = tomllib.loads(cfg_path.read_text(encoding='utf-8'))
+val = conf.get("pr_on_sync", conf.get("global", {}).get("pr_on_sync", False))
+print("1" if val else "0")
+PY
+)"
+PR_FLAG=()
+if [[ "${PR_ON_SYNC}" == "1" ]]; then
+  PR_FLAG=(--pr)
+fi
+
+if [[ ${#WATCH_PATHS[@]} -eq 0 ]]; then
+  echo "No watchable paths resolved from ${CFG}." >&2
+  exit 0
+fi
+
+echo "[clone-watch] Monitoring ${#WATCH_PATHS[@]} path(s):"
+printf ' - %s\n' "${WATCH_PATHS[@]}"
+
+# Debounce: coalesce bursts into a single sync run
+DELAY="5"  # seconds
+LAST=0
+
+trigger() {
+  now=$(date +%s)
+  if (( now - LAST < DELAY )); then
+    return
+  fi
+  LAST=$now
+  echo "[clone-watch] Change detected → syncing…"
+  "${CLONE}" --push --scan-secrets --force --rebase "${PR_FLAG[@]}" || echo "[clone-watch] clone failed (non-fatal)."
+}
+
+# Start a single inotifywait across all trees
+inotifywait -m -r -e modify,create,delete,move --format '%w%f %e' "${WATCH_PATHS[@]}" | \
+while read -r path event; do
+  # Skip tmp/hidden noise
+  base="$(basename "$path")"
+  case "$base" in
+    .git|__pycache__|.mypy_cache|.pytest_cache|*.swp|*.swx|*.tmp) continue ;;
+  esac
+  trigger
+done

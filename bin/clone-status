@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+clone-status: Status dashboard for File-Window clone sync system.
+
+Displays real-time sync status, metrics, and health information.
+
+Usage:
+    clone-status              # Full dashboard
+    clone-status --json       # JSON output for scripting
+    clone-status --watch      # Continuous monitoring mode
+    clone-status --health     # Quick health check (exit code)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+REPO_DIR = Path(__file__).resolve().parents[1]
+METRICS_FILE = REPO_DIR / ".clone-watch-metrics.json"
+STATE_FILE = REPO_DIR / ".clone-watch-state.json"
+SYNC_STATUS_FILE = REPO_DIR / ".sync_status"
+HEALTH_URL = "http://127.0.0.1:9847"
+
+# ANSI colors
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+
+
+def colorize(text: str, color: str, bold: bool = False) -> str:
+    """Apply color to text."""
+    prefix = Colors.BOLD if bold else ""
+    return f"{prefix}{color}{text}{Colors.RESET}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Collection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_service_status() -> dict:
+    """Get systemd service status."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "file-window-clone-watch.service",
+             "--property=ActiveState,SubState,MainPID,ExecMainStartTimestamp,"
+             "NRestarts,MemoryCurrent,CPUUsageNSec"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        status = {}
+        for line in result.stdout.strip().split("\n"):
+            if "=" in line:
+                key, value = line.split("=", 1)
+                status[key] = value
+        return status
+    except Exception:
+        return {}
+
+
+def get_health_endpoint() -> dict | None:
+    """Query health endpoint."""
+    try:
+        req = urllib.request.Request(f"{HEALTH_URL}/status", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def get_metrics_file() -> dict | None:
+    """Read persisted metrics."""
+    try:
+        if METRICS_FILE.exists():
+            return json.loads(METRICS_FILE.read_text())
+    except Exception:
+        pass
+    return None
+
+
+def get_sync_status() -> str | None:
+    """Read last sync timestamp."""
+    try:
+        if SYNC_STATUS_FILE.exists():
+            return SYNC_STATUS_FILE.read_text().strip()
+    except Exception:
+        pass
+    return None
+
+
+def get_git_status() -> dict:
+    """Get git repository status."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_DIR), "status", "--porcelain", "-b"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        lines = result.stdout.strip().split("\n")
+        branch_line = lines[0] if lines else ""
+        changes = [l for l in lines[1:] if l.strip()]
+
+        # Parse branch info
+        branch = "unknown"
+        ahead = behind = 0
+        if branch_line.startswith("##"):
+            parts = branch_line[3:].split("...")
+            branch = parts[0]
+            if len(parts) > 1 and "[" in parts[1]:
+                info = parts[1].split("[")[1].rstrip("]")
+                if "ahead" in info:
+                    ahead = int(info.split("ahead ")[1].split(",")[0].split("]")[0])
+                if "behind" in info:
+                    behind = int(info.split("behind ")[1].split(",")[0].split("]")[0])
+
+        return {
+            "branch": branch,
+            "ahead": ahead,
+            "behind": behind,
+            "uncommitted_changes": len(changes),
+            "clean": len(changes) == 0,
+        }
+    except Exception:
+        return {"branch": "unknown", "ahead": 0, "behind": 0, "uncommitted_changes": 0, "clean": True}
+
+
+def get_last_commits(count: int = 3) -> list[dict]:
+    """Get recent commits."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_DIR), "log", f"-{count}",
+             "--format=%H|%h|%s|%cr|%an"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        commits = []
+        for line in result.stdout.strip().split("\n"):
+            if "|" in line:
+                parts = line.split("|")
+                commits.append({
+                    "hash": parts[0],
+                    "short_hash": parts[1],
+                    "subject": parts[2],
+                    "relative_time": parts[3],
+                    "author": parts[4],
+                })
+        return commits
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Display
+# ─────────────────────────────────────────────────────────────────────────────
+
+def format_duration(seconds: float) -> str:
+    """Format seconds into human-readable duration."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    elif seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    else:
+        return f"{seconds / 86400:.1f}d"
+
+
+def format_bytes(bytes_val: int) -> str:
+    """Format bytes into human-readable size."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f}{unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f}TB"
+
+
+def print_header(title: str):
+    """Print section header."""
+    print(f"\n{colorize(f'━━━ {title} ', Colors.CYAN, bold=True)}{'━' * (50 - len(title))}")
+
+
+def print_kv(key: str, value: str, color: str = Colors.RESET):
+    """Print key-value pair."""
+    print(f"  {colorize(key + ':', Colors.DIM):30} {color}{value}{Colors.RESET}")
+
+
+def display_dashboard():
+    """Display full status dashboard."""
+    print(colorize("\n╔══════════════════════════════════════════════════════════╗", Colors.BLUE, bold=True))
+    print(colorize("║         FILE-WINDOW CLONE SYNC STATUS DASHBOARD          ║", Colors.BLUE, bold=True))
+    print(colorize("╚══════════════════════════════════════════════════════════╝", Colors.BLUE, bold=True))
+
+    # Service Status
+    print_header("Service Status")
+    svc = get_service_status()
+    if svc:
+        state = svc.get("ActiveState", "unknown")
+        sub_state = svc.get("SubState", "")
+        state_color = Colors.GREEN if state == "active" else Colors.RED if state == "failed" else Colors.YELLOW
+
+        print_kv("Status", f"{state} ({sub_state})", state_color)
+        print_kv("PID", svc.get("MainPID", "N/A"))
+        print_kv("Restarts", svc.get("NRestarts", "0"))
+
+        if svc.get("MemoryCurrent"):
+            mem = svc.get("MemoryCurrent", "0")
+            if mem != "[not set]" and mem.isdigit():
+                print_kv("Memory", format_bytes(int(mem)))
+
+        if svc.get("ExecMainStartTimestamp"):
+            print_kv("Started", svc.get("ExecMainStartTimestamp", "").split(" ")[0])
+    else:
+        print_kv("Status", "Service not running or not found", Colors.RED)
+
+    # Health Endpoint
+    print_header("Health & Metrics")
+    health = get_health_endpoint()
+    metrics = health.get("metrics") if health else get_metrics_file()
+
+    if metrics:
+        success_rate = metrics.get("sync_success_rate", 1.0) * 100
+        rate_color = Colors.GREEN if success_rate >= 95 else Colors.YELLOW if success_rate >= 80 else Colors.RED
+
+        print_kv("Syncs Total", str(metrics.get("syncs_total", 0)))
+        print_kv("Success Rate", f"{success_rate:.1f}%", rate_color)
+        print_kv("Consecutive Failures", str(metrics.get("consecutive_failures", 0)),
+                 Colors.RED if metrics.get("consecutive_failures", 0) > 0 else Colors.GREEN)
+        print_kv("Events Received", str(metrics.get("events_received", 0)))
+        print_kv("Events Coalesced", str(metrics.get("events_coalesced", 0)))
+
+        if metrics.get("last_sync_timestamp"):
+            ts = metrics["last_sync_timestamp"]
+            last_sync = datetime.fromtimestamp(ts, timezone.utc)
+            age = time.time() - ts
+            age_color = Colors.GREEN if age < 300 else Colors.YELLOW if age < 3600 else Colors.RED
+            print_kv("Last Sync", f"{last_sync.strftime('%Y-%m-%d %H:%M:%S')} ({format_duration(age)} ago)", age_color)
+            print_kv("Sync Duration", f"{metrics.get('last_sync_duration_seconds', 0):.2f}s")
+
+        if health:
+            print_kv("Uptime", format_duration(metrics.get("uptime_seconds", 0)))
+    else:
+        # Fallback to sync status file
+        sync_status = get_sync_status()
+        if sync_status:
+            print_kv("Last Sync", sync_status)
+        else:
+            print_kv("Metrics", "Not available (daemon not running?)", Colors.YELLOW)
+
+    # Git Status
+    print_header("Git Repository")
+    git = get_git_status()
+    print_kv("Branch", git["branch"], Colors.MAGENTA)
+
+    sync_status = ""
+    if git["ahead"] > 0:
+        sync_status += colorize(f"↑{git['ahead']} ahead", Colors.GREEN)
+    if git["behind"] > 0:
+        if sync_status:
+            sync_status += " "
+        sync_status += colorize(f"↓{git['behind']} behind", Colors.RED)
+    if not sync_status:
+        sync_status = colorize("In sync", Colors.GREEN)
+    print_kv("Remote Sync", sync_status)
+
+    tree_status = colorize("Clean", Colors.GREEN) if git["clean"] else \
+                  colorize(f"{git['uncommitted_changes']} uncommitted changes", Colors.YELLOW)
+    print_kv("Working Tree", tree_status)
+
+    # Recent Commits
+    print_header("Recent Syncs")
+    commits = get_last_commits(5)
+    for commit in commits:
+        is_clone = "clone" in commit["subject"].lower()
+        color = Colors.CYAN if is_clone else Colors.DIM
+        short = commit["short_hash"]
+        msg = commit["subject"][:45] + "..." if len(commit["subject"]) > 45 else commit["subject"]
+        time_ago = commit["relative_time"]
+        print(f"  {colorize(short, color)} {msg:50} {Colors.DIM}{time_ago}{Colors.RESET}")
+
+    # Health Endpoint Info
+    print_header("Endpoints")
+    print_kv("Health Check", f"{HEALTH_URL}/health")
+    print_kv("Metrics (Prometheus)", f"{HEALTH_URL}/metrics")
+    print_kv("Full Status", f"{HEALTH_URL}/status")
+
+    print()
+
+
+def display_json():
+    """Output status as JSON."""
+    data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "service": get_service_status(),
+        "health": get_health_endpoint(),
+        "metrics": get_metrics_file(),
+        "git": get_git_status(),
+        "recent_commits": get_last_commits(5),
+        "sync_status": get_sync_status(),
+    }
+    print(json.dumps(data, indent=2, default=str))
+
+
+def health_check() -> int:
+    """Quick health check returning exit code."""
+    health = get_health_endpoint()
+    if health:
+        metrics = health.get("metrics", {})
+        if metrics.get("consecutive_failures", 0) < 3:
+            return 0
+    return 1
+
+
+def watch_mode():
+    """Continuous monitoring mode."""
+    try:
+        while True:
+            subprocess.run(["clear"])
+            display_dashboard()
+            print(f"{Colors.DIM}Refreshing in 5s... (Ctrl+C to exit){Colors.RESET}")
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\nExiting watch mode.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="File-Window Clone Sync Status Dashboard",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring mode")
+    parser.add_argument("--health", action="store_true", help="Quick health check (exit code 0=healthy, 1=unhealthy)")
+
+    args = parser.parse_args()
+
+    if args.health:
+        sys.exit(health_check())
+    elif args.json:
+        display_json()
+    elif args.watch:
+        watch_mode()
+    else:
+        display_dashboard()
+
+
+if __name__ == "__main__":
+    main()

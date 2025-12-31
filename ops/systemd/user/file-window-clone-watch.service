@@ -1,0 +1,56 @@
+[Unit]
+Description=File-Window Clone Watch Daemon (Production)
+Documentation=https://github.com/<REDACTED_GITHUB_USER>/File-Window
+After=default.target
+
+[Service]
+Type=notify
+ExecStart=%h/File-Window/.venv/bin/python3 %h/File-Window/bin/clone-watch-daemon --no-notify
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Watchdog: systemd will restart if no ping within 60s
+WatchdogSec=60s
+NotifyAccess=main
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=0 2
+
+# Environment
+Environment=PATH=%h/File-Window/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin:%h/.local/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=%h
+Environment="GIT_SSH_COMMAND=ssh -o BatchMode=yes -o IdentitiesOnly=yes -i %h/.ssh/id_ed25519_github"
+
+# Working directory
+WorkingDirectory=%h/File-Window
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clone-watch
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resource Controls (user service compatible)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CGroup weights (lower = less impact on interactive desktop)
+CPUWeight=10
+IOWeight=10
+
+# Memory limits
+MemoryMax=512M
+MemoryHigh=384M
+
+# CPU priority (low priority to avoid impacting trading systems)
+Nice=10
+
+# Process limits
+TasksMax=50
+
+# File descriptor limits
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target

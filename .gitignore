@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+*.pyc
+*.pyo
+*.log
+*.tmp
+*.bak
+.clone-watch.lock
+.clone-watch-state.json
+.clone-watch-metrics.json
+.sync_status
+MANIFEST_CLONE.json
